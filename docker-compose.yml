@@ -1,0 +1,37 @@
+ervices:
+  mcp-server:
+    build: .
+    container_name: mcp_server_odoo
+    ports:
+      - "8000:8000"
+    environment:
+      # Odoo Connection Configuration
+      # Replace these with your actual Odoo instance details
+      - ODOO_URL=https://your-odoo-instance.com
+      - ODOO_DB=your_database_name
+      
+      # Authentication (choose one method):
+      # Option 1: API Key (recommended)
+      - ODOO_API_KEY=your_api_key_here
+      # Option 2: Username and Password (uncomment and use if no API key)
+      # - ODOO_USER=your_username
+      # - ODOO_PASSWORD=your_password
+      
+      # MCP Server Configuration
+      - ODOO_MCP_TRANSPORT=streamable-http
+      - ODOO_MCP_HOST=0.0.0.0
+      - ODOO_MCP_PORT=8000
+      - ODOO_MCP_LOG_LEVEL=INFO
+      
+      # Optional: Performance settings
+      - ODOO_MCP_DEFAULT_LIMIT=10
+      - ODOO_MCP_MAX_LIMIT=100
+    restart: unless-stopped
+    networks:
+      nginx-proxy:
+        ipv4_address: 172.20.0.98
+
+networks:
+  nginx-proxy:
+    external: true
+    name: nginx-proxy 
