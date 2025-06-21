@@ -1,4 +1,4 @@
-ervices:
+services:
   mcp-server:
     build: .
     container_name: mcp_server_odoo

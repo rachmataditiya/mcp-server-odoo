@@ -7,11 +7,12 @@ WORKDIR /app
 # Install uv, a fast Python package installer
 RUN pip install uv
 
-# Copy the dependency definitions
-COPY pyproject.toml uv.lock* ./
+# Copy the dependency definitions and README
+COPY pyproject.toml uv.lock* README.md ./
 
 # Install project dependencies using uv
-RUN uv pip install .
+# We install the project in editable mode to make the scripts available
+RUN uv pip install . --system
 
 # Copy the application code
 COPY mcp_server_odoo/ ./mcp_server_odoo/
