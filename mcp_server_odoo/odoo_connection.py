@@ -118,12 +118,17 @@ class OdooConnection:
             if not port:
                 port = 443 if parsed.scheme == "https" else 80
 
+            # Build base URL without any path components
+            base_url = f"{parsed.scheme}://{parsed.hostname}"
+            if port not in (80, 443):
+                base_url += f":{port}"
+
             return {
                 "scheme": parsed.scheme,
                 "host": parsed.hostname,
                 "port": port,
                 "path": parsed.path.rstrip("/") or "",
-                "base_url": url.rstrip("/"),
+                "base_url": base_url,
             }
 
         except Exception as e:
@@ -150,12 +155,12 @@ class OdooConnection:
         return TimeoutTransport(self.timeout)
 
     def _create_transport_with_redirects(self) -> xmlrpc.client.Transport:
-        """Create XML-RPC transport with timeout support.
+        """Create XML-RPC transport with timeout support and redirect handling.
         
         Returns:
-            Transport object with timeout
+            Transport object with timeout and redirect support
         """
-        class TimeoutTransport(xmlrpc.client.Transport):
+        class RedirectTransport(xmlrpc.client.Transport):
             def __init__(self, timeout, *args, **kwargs):
                 self.timeout = timeout
                 super().__init__(*args, **kwargs)
@@ -166,7 +171,57 @@ class OdooConnection:
                     connection.sock.settimeout(self.timeout)
                 return connection
 
-        return TimeoutTransport(self.timeout)
+            def request(self, host, handler, request_body, verbose=0):
+                """Override request to handle redirects and SSL issues."""
+                import http.client
+                import urllib.parse
+                import ssl
+                
+                # Parse the URL
+                parsed = urllib.parse.urlparse(handler)
+                
+                # Create context for SSL
+                if parsed.scheme == 'https':
+                    # Create SSL context that ignores certificate verification
+                    context = ssl.create_default_context()
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                    conn = http.client.HTTPSConnection(parsed.netloc, timeout=self.timeout, context=context)
+                else:
+                    conn = http.client.HTTPConnection(parsed.netloc, timeout=self.timeout)
+                
+                # Set headers
+                headers = {
+                    'Content-Type': 'text/xml',
+                    'User-Agent': 'Odoo MCP Server',
+                    'Host': parsed.netloc,
+                }
+                
+                try:
+                    # Make the request
+                    conn.request('POST', parsed.path, request_body, headers)
+                    response = conn.getresponse()
+                    
+                    # Handle redirects
+                    if response.status in (301, 302, 307, 308):
+                        location = response.getheader('Location')
+                        if location:
+                            # Follow the redirect
+                            conn.close()
+                            return self.request(host, location, request_body, verbose)
+                    
+                    # Read response
+                    data = response.read()
+                    conn.close()
+                    
+                    # Return response in expected format
+                    return response.status, response.reason, data
+                    
+                except Exception as e:
+                    conn.close()
+                    raise e
+
+        return RedirectTransport(self.timeout)
 
     def _build_endpoint_url(self, endpoint: str) -> str:
         """Build full URL for an MCP endpoint.
@@ -219,14 +274,17 @@ class OdooConnection:
             }
         ]
         
+        logger.info(f"Starting endpoint detection for {self._url_components['base_url']}")
+        
         # Try with current URL scheme first
         for endpoint_set in endpoint_sets:
             try:
-                logger.debug(f"Trying {endpoint_set['name']} endpoints...")
+                endpoint_url = self._build_endpoint_url(endpoint_set['common'])
+                logger.info(f"Trying {endpoint_set['name']} endpoint: {endpoint_url}")
                 
                 # Test common endpoint
                 test_proxy = xmlrpc.client.ServerProxy(
-                    self._build_endpoint_url(endpoint_set['common']),
+                    endpoint_url,
                     transport=self._create_transport_with_redirects()
                 )
                 
@@ -238,11 +296,12 @@ class OdooConnection:
                 endpoints['common'] = endpoint_set['common']
                 endpoints['object'] = endpoint_set['object']
                 
-                logger.info(f"Using {endpoint_set['name']} endpoints")
+                logger.info(f"Successfully connected using {endpoint_set['name']} endpoints")
+                logger.info(f"Server version: {version}")
                 return endpoints
                 
             except Exception as e:
-                logger.debug(f"{endpoint_set['name']} endpoints not available: {e}")
+                logger.warning(f"{endpoint_set['name']} endpoints failed: {type(e).__name__}: {e}")
                 continue
         
         # If HTTP failed, try HTTPS
@@ -258,10 +317,11 @@ class OdooConnection:
             try:
                 for endpoint_set in endpoint_sets:
                     try:
-                        logger.debug(f"Trying {endpoint_set['name']} endpoints with HTTPS...")
+                        endpoint_url = self._build_endpoint_url(endpoint_set['common'])
+                        logger.info(f"Trying {endpoint_set['name']} HTTPS endpoint: {endpoint_url}")
                         
                         test_proxy = xmlrpc.client.ServerProxy(
-                            self._build_endpoint_url(endpoint_set['common']),
+                            endpoint_url,
                             transport=self._create_transport_with_redirects()
                         )
                         
@@ -271,11 +331,12 @@ class OdooConnection:
                         endpoints['common'] = endpoint_set['common']
                         endpoints['object'] = endpoint_set['object']
                         
-                        logger.info(f"Using {endpoint_set['name']} endpoints with HTTPS")
+                        logger.info(f"Successfully connected using {endpoint_set['name']} HTTPS endpoints")
+                        logger.info(f"Server version: {version}")
                         return endpoints
                         
                     except Exception as e:
-                        logger.debug(f"{endpoint_set['name']} HTTPS endpoints not available: {e}")
+                        logger.warning(f"{endpoint_set['name']} HTTPS endpoints failed: {type(e).__name__}: {e}")
                         continue
             finally:
                 # Restore original scheme
@@ -284,6 +345,12 @@ class OdooConnection:
         
         # If we get here, no endpoints worked
         logger.error("No available XML-RPC endpoints found on Odoo server")
+        logger.error(f"Tried URL: {self._url_components['base_url']}")
+        logger.error("Please check:")
+        logger.error("1. Odoo server is running and accessible")
+        logger.error("2. XML-RPC is enabled in Odoo configuration")
+        logger.error("3. Network connectivity and firewall settings")
+        logger.error("4. URL is correct and includes proper scheme (http/https)")
         raise OdooConnectionError("No available XML-RPC endpoints found on Odoo server")
 
     def connect(self) -> None:
