@@ -23,6 +23,61 @@ An MCP server that enables AI assistants like Claude to interact with Odoo ERP s
 - 🎯 **Smart pagination** for large datasets
 - 💬 **LLM-optimized output** with hierarchical text formatting
 
+## Odoo External API Compliance
+
+This MCP server is fully compliant with the [Odoo External API documentation](https://odoo-documentation.oeerp.com/developer/api/external_api.html) and implements all standard XML-RPC endpoints and methods:
+
+### Standard XML-RPC Endpoints
+
+The server automatically detects and uses the appropriate endpoints in order of preference:
+
+1. **MCP-specific endpoints** (if MCP addon is installed):
+   - `/mcp/xmlrpc/db`
+   - `/mcp/xmlrpc/common` 
+   - `/mcp/xmlrpc/object`
+
+2. **Standard Odoo endpoints** (fallback for vanilla installations):
+   - `/xmlrpc/2/db`
+   - `/xmlrpc/2/common`
+   - `/xmlrpc/2/object`
+
+3. **Alternative endpoints** (some Odoo installations):
+   - `/xmlrpc/db`
+   - `/xmlrpc/common`
+   - `/xmlrpc/object`
+
+4. **Legacy endpoints** (older Odoo versions):
+   - `/xmlrpc/1/db`
+   - `/xmlrpc/1/common`
+   - `/xmlrpc/1/object`
+
+### Authentication Methods
+
+Following Odoo's standard authentication patterns:
+
+- **API Key Authentication**: Modern approach using custom headers
+- **Username/Password Authentication**: Traditional approach using `common.authenticate(db, username, password, user_agent_env)`
+
+### Standard Odoo Methods
+
+All standard Odoo XML-RPC methods are supported:
+
+- **CRUD Operations**: `create()`, `read()`, `write()`, `unlink()`
+- **Search Operations**: `search()`, `search_read()`, `search_count()`
+- **Model Introspection**: `fields_get()`, model discovery via `ir.model`
+- **Database Operations**: `list()`, `authenticate()`, `version()`
+
+### Error Handling
+
+Comprehensive error handling for common Odoo scenarios:
+
+- Invalid credentials
+- Database not found
+- User not found
+- Access denied
+- Network timeouts
+- 301 redirects (automatic HTTPS fallback)
+
 ## Installation
 
 ### Prerequisites

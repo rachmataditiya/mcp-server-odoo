@@ -43,6 +43,16 @@ class OdooConnection:
     STANDARD_DB_ENDPOINT = "/xmlrpc/2/db"
     STANDARD_COMMON_ENDPOINT = "/xmlrpc/2/common"
     STANDARD_OBJECT_ENDPOINT = "/xmlrpc/2/object"
+    
+    # Alternative endpoints (some Odoo installations use these)
+    ALT_DB_ENDPOINT = "/xmlrpc/db"
+    ALT_COMMON_ENDPOINT = "/xmlrpc/common"
+    ALT_OBJECT_ENDPOINT = "/xmlrpc/object"
+    
+    # Legacy endpoints (older Odoo versions)
+    LEGACY_DB_ENDPOINT = "/xmlrpc/1/db"
+    LEGACY_COMMON_ENDPOINT = "/xmlrpc/1/common"
+    LEGACY_OBJECT_ENDPOINT = "/xmlrpc/1/object"
 
     # Connection timeout in seconds
     DEFAULT_TIMEOUT = 30
@@ -139,6 +149,25 @@ class OdooConnection:
 
         return TimeoutTransport(self.timeout)
 
+    def _create_transport_with_redirects(self) -> xmlrpc.client.Transport:
+        """Create XML-RPC transport with timeout support.
+        
+        Returns:
+            Transport object with timeout
+        """
+        class TimeoutTransport(xmlrpc.client.Transport):
+            def __init__(self, timeout, *args, **kwargs):
+                self.timeout = timeout
+                super().__init__(*args, **kwargs)
+
+            def make_connection(self, host):
+                connection = super().make_connection(host)
+                if hasattr(connection, "sock") and connection.sock:
+                    connection.sock.settimeout(self.timeout)
+                return connection
+
+        return TimeoutTransport(self.timeout)
+
     def _build_endpoint_url(self, endpoint: str) -> str:
         """Build full URL for an MCP endpoint.
 
@@ -158,38 +187,104 @@ class OdooConnection:
         """
         endpoints = {}
         
-        # Try MCP endpoints first
-        try:
-            test_proxy = xmlrpc.client.ServerProxy(
-                self._build_endpoint_url(self.MCP_COMMON_ENDPOINT),
-                transport=self._create_transport()
-            )
-            test_proxy.version()
-            # If we get here, MCP endpoints are available
-            endpoints['db'] = self.MCP_DB_ENDPOINT
-            endpoints['common'] = self.MCP_COMMON_ENDPOINT
-            endpoints['object'] = self.MCP_OBJECT_ENDPOINT
-            logger.info("Using MCP-specific endpoints")
-            return endpoints
-        except Exception as e:
-            logger.debug(f"MCP endpoints not available: {e}")
+        # Define endpoint sets to try in order of preference
+        endpoint_sets = [
+            # MCP endpoints (preferred)
+            {
+                'name': 'MCP',
+                'db': self.MCP_DB_ENDPOINT,
+                'common': self.MCP_COMMON_ENDPOINT,
+                'object': self.MCP_OBJECT_ENDPOINT
+            },
+            # Standard Odoo endpoints
+            {
+                'name': 'Standard',
+                'db': self.STANDARD_DB_ENDPOINT,
+                'common': self.STANDARD_COMMON_ENDPOINT,
+                'object': self.STANDARD_OBJECT_ENDPOINT
+            },
+            # Alternative endpoints
+            {
+                'name': 'Alternative',
+                'db': self.ALT_DB_ENDPOINT,
+                'common': self.ALT_COMMON_ENDPOINT,
+                'object': self.ALT_OBJECT_ENDPOINT
+            },
+            # Legacy endpoints
+            {
+                'name': 'Legacy',
+                'db': self.LEGACY_DB_ENDPOINT,
+                'common': self.LEGACY_COMMON_ENDPOINT,
+                'object': self.LEGACY_OBJECT_ENDPOINT
+            }
+        ]
         
-        # Fallback to standard Odoo endpoints
-        try:
-            test_proxy = xmlrpc.client.ServerProxy(
-                self._build_endpoint_url(self.STANDARD_COMMON_ENDPOINT),
-                transport=self._create_transport()
-            )
-            test_proxy.version()
-            # If we get here, standard endpoints are available
-            endpoints['db'] = self.STANDARD_DB_ENDPOINT
-            endpoints['common'] = self.STANDARD_COMMON_ENDPOINT
-            endpoints['object'] = self.STANDARD_OBJECT_ENDPOINT
-            logger.info("Using standard Odoo XML-RPC endpoints")
-            return endpoints
-        except Exception as e:
-            logger.error(f"Standard Odoo endpoints not available: {e}")
-            raise OdooConnectionError("No available XML-RPC endpoints found on Odoo server")
+        # Try with current URL scheme first
+        for endpoint_set in endpoint_sets:
+            try:
+                logger.debug(f"Trying {endpoint_set['name']} endpoints...")
+                
+                # Test common endpoint
+                test_proxy = xmlrpc.client.ServerProxy(
+                    self._build_endpoint_url(endpoint_set['common']),
+                    transport=self._create_transport_with_redirects()
+                )
+                
+                # Try to get version
+                version = test_proxy.version()
+                
+                # If we get here, this endpoint set works
+                endpoints['db'] = endpoint_set['db']
+                endpoints['common'] = endpoint_set['common']
+                endpoints['object'] = endpoint_set['object']
+                
+                logger.info(f"Using {endpoint_set['name']} endpoints")
+                return endpoints
+                
+            except Exception as e:
+                logger.debug(f"{endpoint_set['name']} endpoints not available: {e}")
+                continue
+        
+        # If HTTP failed, try HTTPS
+        if self._url_components['scheme'] == 'http':
+            logger.info("HTTP failed, trying HTTPS...")
+            original_scheme = self._url_components['scheme']
+            original_base_url = self._url_components['base_url']
+            
+            # Temporarily switch to HTTPS
+            self._url_components['scheme'] = 'https'
+            self._url_components['base_url'] = self._url_components['base_url'].replace('http://', 'https://')
+            
+            try:
+                for endpoint_set in endpoint_sets:
+                    try:
+                        logger.debug(f"Trying {endpoint_set['name']} endpoints with HTTPS...")
+                        
+                        test_proxy = xmlrpc.client.ServerProxy(
+                            self._build_endpoint_url(endpoint_set['common']),
+                            transport=self._create_transport_with_redirects()
+                        )
+                        
+                        version = test_proxy.version()
+                        
+                        endpoints['db'] = endpoint_set['db']
+                        endpoints['common'] = endpoint_set['common']
+                        endpoints['object'] = endpoint_set['object']
+                        
+                        logger.info(f"Using {endpoint_set['name']} endpoints with HTTPS")
+                        return endpoints
+                        
+                    except Exception as e:
+                        logger.debug(f"{endpoint_set['name']} HTTPS endpoints not available: {e}")
+                        continue
+            finally:
+                # Restore original scheme
+                self._url_components['scheme'] = original_scheme
+                self._url_components['base_url'] = original_base_url
+        
+        # If we get here, no endpoints worked
+        logger.error("No available XML-RPC endpoints found on Odoo server")
+        raise OdooConnectionError("No available XML-RPC endpoints found on Odoo server")
 
     def connect(self) -> None:
         """Establish connection to Odoo server.
@@ -405,14 +500,22 @@ class OdooConnection:
             List of database names
 
         Raises:
-            OdooConnectionError: If listing fails or not connected
+            OdooConnectionError: If listing fails
         """
         if not self._connected:
             raise OdooConnectionError("Not connected to Odoo")
 
         try:
             # Call list_db method on database proxy
-            databases = self.db_proxy.list()
+            result = self.db_proxy.list()
+            # Handle XML-RPC return value which could be various types
+            if isinstance(result, (list, tuple)):
+                databases = [str(db) for db in result]
+            elif result is None:
+                databases = []
+            else:
+                # Single value case
+                databases = [str(result)]
             logger.info(f"Found {len(databases)} databases: {databases}")
             return databases
         except Exception as e:
@@ -613,11 +716,14 @@ class OdooConnection:
 
         try:
             # Use common proxy to authenticate
-            uid = self.common_proxy.authenticate(
+            # According to Odoo documentation: authenticate(db, username, password, user_agent_env)
+            result = self.common_proxy.authenticate(
                 database, self.config.username, self.config.password, {}
             )
 
-            if uid:
+            # Odoo authenticate returns user ID as int or False
+            if result and isinstance(result, (int, float)):
+                uid = int(result)  # Ensure it's an integer
                 self._uid = uid
                 self._database = database
                 self._auth_method = "password"
@@ -629,8 +735,19 @@ class OdooConnection:
                 return False
 
         except xmlrpc.client.Fault as e:
-            logger.warning(f"Authentication fault: {e}")
-            return False
+            # Handle specific Odoo authentication errors
+            if "Access Denied" in str(e) or "Invalid credentials" in str(e):
+                logger.warning("Invalid username or password")
+                return False
+            elif "Database not found" in str(e):
+                logger.warning(f"Database '{database}' not found")
+                return False
+            elif "User not found" in str(e):
+                logger.warning(f"User '{self.config.username}' not found in database '{database}'")
+                return False
+            else:
+                logger.error(f"Authentication fault: {e}")
+                return False
         except Exception as e:
             logger.error(f"Error during password authentication: {e}")
             raise OdooConnectionError(f"Failed to authenticate: {e}") from e
@@ -981,7 +1098,15 @@ class OdooConnection:
             return None
 
         try:
-            return self.common_proxy.version()
+            result = self.common_proxy.version()
+            # Handle XML-RPC return value which could be various types
+            if isinstance(result, dict):
+                return result
+            elif result is None:
+                return None
+            else:
+                # Convert to dict if it's not already
+                return {"version": str(result)}
         except Exception as e:
             logger.error(f"Failed to get server version: {e}")
             return None
