@@ -34,10 +34,15 @@ class OdooConnection:
     proper resource cleanup for Odoo XML-RPC connections.
     """
 
-    # MCP-specific endpoints
+    # MCP-specific endpoints (preferred)
     MCP_DB_ENDPOINT = "/mcp/xmlrpc/db"
     MCP_COMMON_ENDPOINT = "/mcp/xmlrpc/common"
     MCP_OBJECT_ENDPOINT = "/mcp/xmlrpc/object"
+    
+    # Standard Odoo endpoints (fallback)
+    STANDARD_DB_ENDPOINT = "/xmlrpc/2/db"
+    STANDARD_COMMON_ENDPOINT = "/xmlrpc/2/common"
+    STANDARD_OBJECT_ENDPOINT = "/xmlrpc/2/object"
 
     # Connection timeout in seconds
     DEFAULT_TIMEOUT = 30
@@ -145,10 +150,51 @@ class OdooConnection:
         """
         return f"{self._url_components['base_url']}{endpoint}"
 
+    def _detect_available_endpoints(self) -> Dict[str, str]:
+        """Detect which endpoints are available on the Odoo server.
+        
+        Returns:
+            Dictionary mapping endpoint types to their URLs
+        """
+        endpoints = {}
+        
+        # Try MCP endpoints first
+        try:
+            test_proxy = xmlrpc.client.ServerProxy(
+                self._build_endpoint_url(self.MCP_COMMON_ENDPOINT),
+                transport=self._create_transport()
+            )
+            test_proxy.version()
+            # If we get here, MCP endpoints are available
+            endpoints['db'] = self.MCP_DB_ENDPOINT
+            endpoints['common'] = self.MCP_COMMON_ENDPOINT
+            endpoints['object'] = self.MCP_OBJECT_ENDPOINT
+            logger.info("Using MCP-specific endpoints")
+            return endpoints
+        except Exception as e:
+            logger.debug(f"MCP endpoints not available: {e}")
+        
+        # Fallback to standard Odoo endpoints
+        try:
+            test_proxy = xmlrpc.client.ServerProxy(
+                self._build_endpoint_url(self.STANDARD_COMMON_ENDPOINT),
+                transport=self._create_transport()
+            )
+            test_proxy.version()
+            # If we get here, standard endpoints are available
+            endpoints['db'] = self.STANDARD_DB_ENDPOINT
+            endpoints['common'] = self.STANDARD_COMMON_ENDPOINT
+            endpoints['object'] = self.STANDARD_OBJECT_ENDPOINT
+            logger.info("Using standard Odoo XML-RPC endpoints")
+            return endpoints
+        except Exception as e:
+            logger.error(f"Standard Odoo endpoints not available: {e}")
+            raise OdooConnectionError("No available XML-RPC endpoints found on Odoo server")
+
     def connect(self) -> None:
         """Establish connection to Odoo server.
 
-        Creates XML-RPC proxies for MCP endpoints but doesn't
+        Creates XML-RPC proxies for available endpoints but doesn't
         authenticate yet. Uses connection pooling for better performance.
 
         Raises:
@@ -159,15 +205,18 @@ class OdooConnection:
             return
 
         try:
+            # Detect available endpoints
+            available_endpoints = self._detect_available_endpoints()
+            
             # Use connection pool for proxies
             self._db_proxy = self._performance_manager.get_optimized_connection(
-                self.MCP_DB_ENDPOINT
+                available_endpoints['db']
             )
             self._common_proxy = self._performance_manager.get_optimized_connection(
-                self.MCP_COMMON_ENDPOINT
+                available_endpoints['common']
             )
             self._object_proxy = self._performance_manager.get_optimized_connection(
-                self.MCP_OBJECT_ENDPOINT
+                available_endpoints['object']
             )
 
             # Test connection by calling server_version
@@ -194,8 +243,11 @@ class OdooConnection:
         """
         try:
             # Try to get server version via common endpoint
-            version = self._common_proxy.version()
-            logger.debug(f"Server version: {version}")
+            if self._common_proxy is not None:
+                version = self._common_proxy.version()
+                logger.debug(f"Server version: {version}")
+            else:
+                raise OdooConnectionError("Common proxy not initialized")
         except Exception as e:
             raise OdooConnectionError(f"Connection test failed: {e}") from e
 
@@ -240,8 +292,15 @@ class OdooConnection:
 
         try:
             # Try to get server version as health check
-            version = self._common_proxy.version()
-            return True, f"Connected to Odoo {version.get('server_version', 'unknown')}"
+            if self._common_proxy is not None:
+                version = self._common_proxy.version()
+                if isinstance(version, dict):
+                    server_version = version.get('server_version', 'unknown')
+                else:
+                    server_version = 'unknown'
+                return True, f"Connected to Odoo {server_version}"
+            else:
+                return False, "Common proxy not available"
         except socket.timeout:
             return False, f"Health check timeout after {self.timeout} seconds"
         except Exception as e:

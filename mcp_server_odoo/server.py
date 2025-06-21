@@ -91,6 +91,8 @@ class OdooMCPServer:
 
                 # Initialize access controller
                 self.access_controller = AccessController(self.config)
+                # Set the connection for access control
+                self.access_controller.set_connection(self.connection)
             except Exception as e:
                 context = ErrorContext(operation="connection_setup")
                 # Let specific errors propagate as-is

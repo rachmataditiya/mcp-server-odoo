@@ -1,7 +1,7 @@
-"""Access control integration with Odoo MCP module.
+"""Access control for Odoo models via XML-RPC.
 
-This module provides integration with the Odoo MCP module's access control
-system via REST API endpoints.
+This module provides access control functionality that works with both
+MCP addon (preferred) and vanilla Odoo installations.
 """
 
 import json
@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import OdooConfig
+from .odoo_connection import OdooConnection
 
 logger = logging.getLogger(__name__)
 
@@ -59,85 +60,50 @@ class CacheEntry:
 
 
 class AccessController:
-    """Controls access to Odoo models via MCP module REST API."""
+    """Controls access to Odoo models via standard XML-RPC methods.
+
+    This controller can work with both MCP addon (preferred) and vanilla Odoo installations.
+    """
 
     # Cache TTL in seconds
     CACHE_TTL = 300  # 5 minutes
-
-    # MCP REST API endpoints
-    MODELS_ENDPOINT = "/mcp/models"
-    MODEL_ACCESS_ENDPOINT = "/mcp/models/{model}/access"
 
     def __init__(self, config: OdooConfig, cache_ttl: int = CACHE_TTL):
         """Initialize access controller.
 
         Args:
-            config: OdooConfig with connection details and API key
-            cache_ttl: Cache time-to-live in seconds
+            config: Odoo configuration
+            cache_ttl: Cache TTL in seconds
         """
         self.config = config
         self.cache_ttl = cache_ttl
         self._cache: Dict[str, CacheEntry] = {}
+        self._connection: Optional[OdooConnection] = None
+        self._use_mcp_addon = False
 
-        # Parse base URL
-        self.base_url = config.url.rstrip("/")
-
-        # Validate API key is available
-        if not config.api_key:
-            raise AccessControlError(
-                "API key required for access control. Please configure ODOO_API_KEY."
-            )
-
-        logger.info(f"Initialized AccessController for {self.base_url}")
-
-    def _make_request(self, endpoint: str, timeout: int = 30) -> Dict[str, Any]:
-        """Make authenticated request to MCP REST API.
+    def set_connection(self, connection: OdooConnection) -> None:
+        """Set the Odoo connection for access control.
 
         Args:
-            endpoint: API endpoint path
-            timeout: Request timeout in seconds
-
-        Returns:
-            Parsed JSON response
-
-        Raises:
-            AccessControlError: If request fails
+            connection: Active Odoo connection
         """
-        url = f"{self.base_url}{endpoint}"
+        self._connection = connection
+        # Detect if MCP addon is available
+        self._detect_mcp_addon()
 
-        # Create request with API key header
-        req = urllib.request.Request(url)
-        req.add_header("X-API-Key", self.config.api_key)
-        req.add_header("Accept", "application/json")
+    def _detect_mcp_addon(self) -> None:
+        """Detect if MCP addon is available and working."""
+        if not self._connection:
+            return
 
         try:
-            logger.debug(f"Making request to {url}")
-
-            with urllib.request.urlopen(req, timeout=timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
-
-                # Check for API response success
-                if not data.get("success", False):
-                    error_msg = data.get("error", {}).get("message", "Unknown error")
-                    raise AccessControlError(f"API error: {error_msg}")
-
-                return data
-
-        except urllib.error.HTTPError as e:
-            if e.code == 401:
-                raise AccessControlError("Invalid API key for access control") from e
-            elif e.code == 403:
-                raise AccessControlError("Access denied to MCP endpoints") from e
-            elif e.code == 404:
-                raise AccessControlError(f"Endpoint not found: {endpoint}") from e
-            else:
-                raise AccessControlError(f"HTTP error {e.code}: {e.reason}") from e
-        except urllib.error.URLError as e:
-            raise AccessControlError(f"Connection error: {e.reason}") from e
-        except json.JSONDecodeError as e:
-            raise AccessControlError(f"Invalid JSON response: {e}") from e
+            # Try to access MCP-specific model
+            self._connection.execute_kw("mcp.enabled.model", "search", [[]], {"limit": 1})
+            self._use_mcp_addon = True
+            logger.info("MCP addon detected - using enhanced access control")
         except Exception as e:
-            raise AccessControlError(f"Request failed: {e}") from e
+            self._use_mcp_addon = False
+            logger.info("MCP addon not available - using basic access control")
 
     def _get_from_cache(self, key: str) -> Optional[Any]:
         """Get value from cache if not expired."""
@@ -162,7 +128,7 @@ class AccessController:
         logger.info("Cleared access control cache")
 
     def get_enabled_models(self) -> List[Dict[str, str]]:
-        """Get list of all MCP-enabled models.
+        """Get list of all accessible models.
 
         Returns:
             List of dicts with 'model' and 'name' keys
@@ -177,30 +143,119 @@ class AccessController:
         if cached is not None:
             return cached
 
-        # Make request
-        response = self._make_request(self.MODELS_ENDPOINT)
-        models = response.get("data", {}).get("models", [])
+        if not self._connection:
+            raise AccessControlError("No connection available for access control")
 
-        # Cache result
-        self._set_cache(cache_key, models)
+        try:
+            if self._use_mcp_addon:
+                # Use MCP addon if available
+                return self._get_enabled_models_mcp()
+            else:
+                # Fallback to basic model discovery
+                return self._get_enabled_models_basic()
+        except Exception as e:
+            logger.error(f"Failed to get enabled models: {e}")
+            # Return empty list as fallback
+            return []
 
-        logger.info(f"Retrieved {len(models)} enabled models")
+    def _get_enabled_models_mcp(self) -> List[Dict[str, str]]:
+        """Get enabled models using MCP addon."""
+        if not self._connection:
+            return []
+            
+        enabled_records = self._connection.execute_kw(
+            "mcp.enabled.model", 
+            "search_read", 
+            [[("active", "=", True)]], 
+            {"fields": ["model_id"]}
+        )
+        
+        models = []
+        for record in enabled_records:
+            model_id = record.get("model_id")
+            if model_id:
+                # Get model details
+                model_info = self._connection.execute_kw(
+                    "ir.model", 
+                    "read", 
+                    [[model_id]], 
+                    {"fields": ["model", "name"]}
+                )
+                if model_info:
+                    models.append({
+                        "model": model_info[0].get("model", ""),
+                        "name": model_info[0].get("name", "")
+                    })
+        
+        return models
+
+    def _get_enabled_models_basic(self) -> List[Dict[str, str]]:
+        """Get accessible models using basic Odoo methods."""
+        if not self._connection:
+            return []
+            
+        # Get all models that the user can access
+        model_ids = self._connection.execute_kw(
+            "ir.model", 
+            "search", 
+            [[("transient", "=", False)]], 
+            {"limit": 1000}  # Reasonable limit
+        )
+        
+        models = []
+        for model_id in model_ids:
+            try:
+                model_info = self._connection.execute_kw(
+                    "ir.model", 
+                    "read", 
+                    [[model_id]], 
+                    {"fields": ["model", "name"]}
+                )
+                if model_info:
+                    model_name = model_info[0].get("model", "")
+                    # Skip system models and private models
+                    if not model_name.startswith("_") and not model_name.startswith("ir."):
+                        models.append({
+                            "model": model_name,
+                            "name": model_info[0].get("name", model_name)
+                        })
+            except Exception as e:
+                logger.debug(f"Could not access model {model_id}: {e}")
+                continue
+        
         return models
 
     def is_model_enabled(self, model: str) -> bool:
-        """Check if a model is MCP-enabled.
+        """Check if a model is accessible.
 
         Args:
             model: The Odoo model name (e.g., 'res.partner')
 
         Returns:
-            True if model is enabled, False otherwise
+            True if model is accessible, False otherwise
         """
         try:
-            enabled_models = self.get_enabled_models()
-            return any(m["model"] == model for m in enabled_models)
-        except AccessControlError as e:
+            if self._use_mcp_addon:
+                # Check MCP enabled models
+                enabled_models = self.get_enabled_models()
+                return any(m["model"] == model for m in enabled_models)
+            else:
+                # Basic check - try to access the model
+                return self._check_model_access_basic(model)
+        except Exception as e:
             logger.error(f"Failed to check if model {model} is enabled: {e}")
+            return False
+
+    def _check_model_access_basic(self, model: str) -> bool:
+        """Basic model access check using standard Odoo methods."""
+        if not self._connection:
+            return False
+
+        try:
+            # Try to get field definitions - if this works, the model is accessible
+            self._connection.fields_get(model)
+            return True
+        except Exception:
             return False
 
     def get_model_permissions(self, model: str) -> ModelPermissions:
@@ -222,26 +277,103 @@ class AccessController:
         if cached is not None:
             return cached
 
-        # Make request
-        endpoint = self.MODEL_ACCESS_ENDPOINT.format(model=model)
-        response = self._make_request(endpoint)
-        data = response.get("data", {})
+        if not self._connection:
+            raise AccessControlError("No connection available for access control")
 
-        # Parse permissions
-        permissions = ModelPermissions(
-            model=data.get("model", model),
-            enabled=data.get("enabled", False),
-            can_read=data.get("operations", {}).get("read", False),
-            can_write=data.get("operations", {}).get("write", False),
-            can_create=data.get("operations", {}).get("create", False),
-            can_unlink=data.get("operations", {}).get("unlink", False),
+        try:
+            if self._use_mcp_addon:
+                # Use MCP addon permissions
+                permissions = self._get_model_permissions_mcp(model)
+            else:
+                # Use basic permission checking
+                permissions = self._get_model_permissions_basic(model)
+
+            # Cache result
+            self._set_cache(cache_key, permissions)
+
+            logger.debug(f"Retrieved permissions for {model}: {permissions}")
+            return permissions
+
+        except Exception as e:
+            logger.error(f"Failed to get permissions for {model}: {e}")
+            # Return default permissions as fallback
+            return ModelPermissions(
+                model=model,
+                enabled=True,
+                can_read=True,
+                can_write=True,
+                can_create=True,
+                can_unlink=True
+            )
+
+    def _get_model_permissions_mcp(self, model: str) -> ModelPermissions:
+        """Get model permissions using MCP addon."""
+        if not self._connection:
+            return ModelPermissions(model=model, enabled=False)
+            
+        # Find the model record
+        model_ids = self._connection.execute_kw(
+            "ir.model", 
+            "search", 
+            [[("model", "=", model)]], 
+            {"limit": 1}
+        )
+        
+        if not model_ids:
+            return ModelPermissions(model=model, enabled=False)
+
+        # Get MCP enabled model record
+        enabled_ids = self._connection.execute_kw(
+            "mcp.enabled.model", 
+            "search", 
+            [[("model_id", "=", model_ids[0])]], 
+            {"limit": 1}
+        )
+        
+        if not enabled_ids:
+            return ModelPermissions(model=model, enabled=False)
+
+        # Get permissions
+        enabled_record = self._connection.execute_kw(
+            "mcp.enabled.model", 
+            "read", 
+            [enabled_ids], 
+            {"fields": ["allow_read", "allow_write", "allow_create", "allow_unlink"]}
+        )
+        
+        if not enabled_record:
+            return ModelPermissions(model=model, enabled=False)
+
+        record = enabled_record[0]
+        return ModelPermissions(
+            model=model,
+            enabled=True,
+            can_read=record.get("allow_read", False),
+            can_write=record.get("allow_write", False),
+            can_create=record.get("allow_create", False),
+            can_unlink=record.get("allow_unlink", False)
         )
 
-        # Cache result
-        self._set_cache(cache_key, permissions)
-
-        logger.debug(f"Retrieved permissions for {model}: {permissions}")
-        return permissions
+    def _get_model_permissions_basic(self, model: str) -> ModelPermissions:
+        """Get basic model permissions using standard Odoo methods."""
+        if not self._connection:
+            return ModelPermissions(model=model, enabled=False)
+            
+        # For basic access control, we assume all accessible models have full permissions
+        # This is a simplified approach - in production you might want more granular control
+        try:
+            # Test if we can access the model
+            self._connection.fields_get(model)
+            return ModelPermissions(
+                model=model,
+                enabled=True,
+                can_read=True,
+                can_write=True,
+                can_create=True,
+                can_unlink=True
+            )
+        except Exception:
+            return ModelPermissions(model=model, enabled=False)
 
     def check_operation_allowed(self, model: str, operation: str) -> Tuple[bool, Optional[str]]:
         """Check if an operation is allowed on a model.

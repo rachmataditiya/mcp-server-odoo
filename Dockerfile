@@ -1,26 +1,26 @@
-# Use an official Python runtime as a parent image
+# Gunakan Python 3.11 image yang ringan
 FROM python:3.11-slim
 
-# Set the working directory in the container
+# Set working directory
 WORKDIR /app
 
-# Install uv, a fast Python package installer
+# Install uv
 RUN pip install uv
 
-# Copy the dependency definitions and README
+# Copy dependency files terlebih dahulu (untuk cache optimal)
 COPY pyproject.toml uv.lock* README.md ./
 
-# Install project dependencies using uv
-# We install the project in editable mode to make the scripts available
+# Salin source code ke dalam container
+COPY mcp_server_odoo ./mcp_server_odoo
+
+# Pastikan folder mcp_server_odoo punya __init__.py
+RUN touch mcp_server_odoo/__init__.py
+
+# Install dependencies & project
 RUN uv pip install . --system
 
-# Copy the application code
-COPY mcp_server_odoo/ ./mcp_server_odoo/
-
-# Expose the port the app runs on
+# Expose port
 EXPOSE 8000
 
-# Define the command to run the application
-# We use the script defined in pyproject.toml
-# The host is set to 0.0.0.0 to be accessible from outside the container
-CMD ["mcp-server-odoo", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8000"] 
+# Jalankan server
+CMD ["mcp-server-odoo", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8000"]
